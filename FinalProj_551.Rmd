@@ -1,0 +1,487 @@
+---
+title: "FinalProj_551"
+author: "Jake Gwinn"
+date: "2025-11-29"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(invgamma)
+library(psych)
+library(bayesplot)
+library(GGally)
+library(posterior)
+library(HDInterval)
+library(latex2exp)
+library(patchwork)
+library(rstan)
+library(forcats)
+library(loo)
+library(xtable)
+library(gridExtra)
+```
+
+## Exploratory Data Analysis
+
+### Read in the Data
+
+```{r}
+train <- read_csv("train.csv")
+train_orig <- train 
+```
+
+```{r}
+train %>% head()
+```
+
+### Basic Data Cleaning
+
+```{r}
+train <- train %>% 
+    mutate(
+        blue = as.logical(blue), 
+        dual_sim = as.logical(dual_sim), 
+        four_g = as.logical(four_g), 
+        three_g = as.logical(three_g), 
+        touch_screen = as.logical(touch_screen), 
+        wifi = as.logical(wifi), 
+        
+        n_cores = as.integer(n_cores),
+        price_range = price_range + 1L
+        
+    ) %>% 
+    mutate(
+        price_range = factor(price_range,
+                                  levels = c(1, 2, 3, 4),
+                                  ordered = TRUE)
+    )
+```
+
+### Plots
+
+```{r, warning=FALSE, message=FALSE, fig.width=15, fig.height=15}
+train %>% 
+    ggpairs(
+        # aes(colour = price_range),
+            diag  = list(continuous = wrap("densityDiag", alpha = 0.5)),
+            lower = list(continuous = wrap("points", alpha = 0.4))) +
+    # ggpairs(
+    #     diag  = list(continuous = wrap("densityDiag", alpha = 0.5)), lower = list(continuous = wrap("points", alpha = 0.4))) +
+    scale_fill_brewer(palette = "Set2")
+
+ggsave("pair_plot.png", dpi = 600)
+```
+
+- Pair plot for all variables
+
+```{r}
+train %>% 
+    ggplot(aes(x=price_range, fill = price_range)) + 
+    geom_bar() + 
+    scale_fill_brewer(palette = "Set2") + 
+    labs(
+        title="Price Range Distributions"
+    )
+
+ggsave("price_plot.png", dpi = 600)
+```
+
+- Price category distributions
+
+```{r}
+train %>% 
+    ggplot(aes(x=price_range, y=ram, fill = price_range)) + 
+    scale_fill_brewer(palette = "Set2") + 
+    geom_boxplot() + 
+    labs(
+        title = "RAM vs. Price Range"
+    )
+
+ggsave("ram_vs_price_plot.png", dpi = 600)
+```
+
+- Ram vs price distribution showing monotonic relationship --> will be important
+
+## Modeling
+
+### Basic prep and Scaling
+
+```{r}
+cat_cols <- c("blue", "dual_sim", "four_g", "three_g", "touch_screen", "wifi")
+
+numeric_cols <- colnames(train)[!colnames(train) %in% cat_cols]
+numeric_cols <- numeric_cols[numeric_cols != "price_range"]
+```
+
+```{r}
+df <- train_orig
+
+df[numeric_cols] <- scale(train_orig[numeric_cols])
+df <- df[c(numeric_cols, cat_cols)]
+```
+
+```{r}
+y <- train_orig$price_range + 1L
+X <- as.matrix(df)
+K <- length(unique(y))
+N <- nrow(X)
+D <- ncol(X)
+
+data <- list(N=N, D=D, K=K, X=X, y=y)
+```
+
+```{r, include=FALSE}
+# round(cor(df[, c("ram","int_memory","battery_power","px_width","px_height")]), 2)
+```
+
+### Fitting STAN Model
+
+```{r}
+code_stan <- "phone_fin_proj.stan"
+writeLines(readLines(code_stan))
+```
+
+- This is the STAN code for the model 
+
+```{r}
+mod_fit <- stan(file = code_stan, data = data,
+                 chains = 4, seed = 42, iter = 5000,
+                 verbose = FALSE)
+```
+
+## Model Results
+
+```{r}
+print(mod_fit, pars = c("beta", "cutpoints"))
+```
+
+- Initial output from the STAN model
+
+```{r, include=FALSE}
+# print(xtable(print(mod_fit, pars = c("beta", "cutpoints")), type = "latex"))
+```
+
+
+```{r, include=FALSE}
+# summary(mod_fit, c("beta", "cutpoints"))$summary
+```
+
+### Model Summaries
+
+```{r}
+
+beta_summ <- summary(mod_fit, pars = "beta")$summary
+beta_summ <- as.data.frame(beta_summ) %>% rownames_to_column(var = "stan_name")
+beta_summ$parameter <- colnames(X)
+
+beta_table <- beta_summ %>% 
+    dplyr::select(, -`50%`, -`75%`) %>% 
+    dplyr::select(parameter, everything())
+beta_table %>% head()
+```
+
+- Model summary table showing us outputs from our model coefficients
+
+```{r, include=FALSE}
+# print(xtable(beta_table, type = "latex"), include.rownames=FALSE)
+```
+
+
+```{r}
+cp_summ <- summary(mod_fit, pars = "cutpoints")$summary
+cp_summ <- as.data.frame(cp_summ) %>% rownames_to_column(var = "stan_name")
+
+cp_summ$parameter <- c("c1", "c2", "c3")
+
+cutpoint_table <- cp_summ %>%
+    dplyr::select(, -`50%`, -`75%`) %>% 
+    dplyr::select(parameter, everything())
+cutpoint_table
+
+```
+
+- Model summary table showing us outputs from our model cutpoints
+
+```{r, include=FALSE}
+# print(xtable(cutpoint_table, type = "latex"), include.rownames=FALSE)
+```
+```{r}
+t <- bind_rows(beta_table, cutpoint_table)
+t
+```
+
+- Combined model summary table showing us outputs from our model coefficients and cutpoints
+
+```{r, include=FALSE}
+# print(xtable(t, type="latex"), include.rownames=FALSE)
+```
+
+
+```{r}
+beta_draws <- as.matrix(mod_fit, pars = "beta")
+colnames(beta_draws) <- colnames(X)
+# beta_draws
+```
+
+- Changing coefficient names back to our variable names for better plotting
+
+### Interval Plots
+
+```{r, include=FALSE}
+# coef_int <- mcmc_intervals(beta_draws) +
+#   ggplot2::labs(
+#     title = "Posterior intervals for regression coefficients",
+#     x = "Coefficient"
+#   )
+```
+
+```{r, fig.height=5, fig.width=10}
+cp_draws <- as.matrix(mod_fit, pars = "cutpoints")
+colnames(cp_draws) <- c("c1", "c2", "c3")
+
+cut_int <- mcmc_intervals(cp_draws) +
+  ggplot2::labs(
+    title = "Posterior intervals for cutpoints",
+    x = "Cutpoint value"
+  )
+
+cut_int
+ggsave("cut_interval_plots.png", dpi = 600)
+```
+- Cutpoint interval plot showing good results
+
+```{r}
+idata <- mcmc_intervals_data(beta_draws,
+                             prob       = 0.5,
+                             prob_outer = 0.95) %>%
+  mutate(includes_zero = (ll <= 0 & hh >= 0))
+
+new_coef_int <- ggplot(idata, aes(y = reorder(parameter, m), x = m)) +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey50") +
+  # 95% interval
+  geom_errorbarh(aes(xmin = ll, xmax = hh,
+                     colour = includes_zero),
+                 height = 0) +
+  # 50% interval
+  geom_errorbarh(aes(xmin = l, xmax = h,
+                     colour = includes_zero),
+                 height = 0, linewidth = 1.4) +
+  geom_point(aes(colour = includes_zero), size = 2) +
+  scale_colour_manual(
+    values = c(`FALSE` = "black", `TRUE` = "grey70"),
+    labels = c(`FALSE` = "95% CI excludes 0",
+               `TRUE`  = "95% CI includes 0"),
+    name = NULL
+  ) +
+  labs(
+    x = "Coefficient",
+    y = NULL,
+    title = "Posterior intervals for regression coefficients"
+  ) +
+  theme_minimal()+ 
+theme(legend.position = "bottom")
+
+new_coef_int
+ggsave("beta_new_interval.png", dpi=600)
+```
+
+- Coefficient interval plot showing our significant variables
+
+```{r, fig.height=5, fig.width=10}
+g <- arrangeGrob(new_coef_int, cut_int, ncol = 2) #generates g
+
+ggsave(file="new_interval_plots.png", g, dpi=600)
+```
+
+
+```{r, fig.width = 15, fig.height=10, include=FALSE}
+# # Extract 3D array: iterations x chains x parameters
+# beta_arr <- rstan::extract(mod_fit, pars = "beta", permuted = FALSE)
+# 
+# # Name the 3rd dim with your predictor names
+# dimnames(beta_arr)[[3]] <- colnames(X)  # e.g. "ram", "storage", ...
+# 
+# coef_trace <- mcmc_trace(beta_arr)
+# 
+# # ggsave("coef_trace.png", dpi = 600)
+```
+
+```{r, fig.height=5, fig.width=15, include=FALSE}
+# cp_arr <- rstan::extract(mod_fit, pars = "cutpoints", permuted = FALSE)
+# dimnames(cp_arr)[[3]] <- c("c1", "c2", "c3")
+# 
+# cut_trace <- mcmc_trace(cp_arr, pars = c("c1", "c2", "c3"))
+# 
+# grid.arrange(coef_trace, cut_trace, ncol=2)
+# 
+# # ggsave("cutoff_trace.png", dpi = 600)
+```
+
+
+### Trace Plot
+
+```{r}
+all_arr <- as.array(mod_fit, pars = c("beta", "cutpoints"))
+```
+
+```{r}
+D    <- ncol(X)   # number of predictors
+K    <- 4         # number of categories
+beta_names <- colnames(X)                # "battery_power", "ram"
+cp_names   <- paste0("c", 1:(K - 1))     # "c1", "c2", "c3"
+
+dimnames(all_arr)[[3]] <- c(beta_names, cp_names)
+```
+
+```{r, fig.width = 15, fig.height=10}
+# rstan::traceplot(mod_fit, pars = c("beta", "cutpoints"))
+
+mcmc_trace(
+  all_arr,
+  pars = c(beta_names, cp_names)
+)
+
+ggsave("trace_plots.png", dpi = 600)
+```
+
+- Trace plots of all coefficients and cutpoints showing good mixing and convergence
+
+```{r, include=FALSE}
+# loglik_basic <- rstan::extract(mod_fit, "log_lik")$log_lik
+# 
+# loo_basic <- loo(loglik_basic)
+# loo_basic
+```
+
+## Posterior Predictive Draws and Checks
+
+```{r}
+color_scheme_set("brightblue") 
+
+y <- data$y     
+K <- data$K
+```
+
+```{r}
+yrep_basic <- rstan::extract(mod_fit, "y_pred")$y_pred
+```
+
+```{r, fig.height=5, fig.width=7}
+freq_ppc <- ppc_bars(
+  y = y,
+  yrep = yrep_basic
+) +
+  ggplot2::labs(
+    title = "Category frequencies",
+    x = "Price category", y = "Proportion"
+  )
+
+freq_ppc
+ggsave("ppc_category_freq.png", dpi=600)
+```
+
+- Posterior predictive checks on price categories. Shows that the model accurately captures the empirical distribution 
+
+```{r, fig.height=5, fig.width=7}
+mean_ppc <- ppc_stat(
+  y = y,
+  yrep = yrep_basic,
+  stat = "mean"
+) +
+  ggplot2::labs(
+    title = "Mean price category"
+  )
+
+mean_ppc
+ggsave("ppc_mean.png", dpi=600)
+```
+
+- Posterior predictive check on the mean. We find that the mean of the data is accurately capture in our posterior distribution indicating no over or under estimation 
+
+```{r, fig.height=4, fig.width=9}
+grid.arrange(freq_ppc, mean_ppc, ncol=2)
+g <- arrangeGrob(freq_ppc, mean_ppc, ncol = 2)
+ggsave(file="ppc_basics.png", g, dpi=600)
+```
+
+```{r, include=FALSE}
+# g <- arrangeGrob(new_coef_int, cut_int, ncol = 2)
+```
+
+
+```{r, include=FALSE, eval=FALSE}
+i <- 10
+# ppc_hist(
+#   y = y[i],
+#   yrep = yrep_basic[, i, drop = FALSE]
+# ) +
+#   ggplot2::labs(
+#     title = paste("PPC: predictive distribution for phone", i, "(basic)")
+#   )
+
+set.seed(123)
+draws <- sample(seq_len(dim(yrep_basic)[1]), 50)
+
+ppc_hist(
+  y    = y,
+  yrep = yrep_basic[draws, , drop = FALSE]
+)
+```
+
+```{r, include=T, eval=T}
+i <- c(97, 26, 27, 28, 29, 45, 67, 89, 19)
+i <- 57
+# draws <- sample(seq_len(dim(yrep_basic)[1]), 500)
+draws <- dim(yrep_basic)[1]
+
+# png(filename = "phone_pred.png", width = 800, height = 600, units = "px", res = 100)
+
+hist(
+  yrep_basic[, i],
+  breaks = seq(0.5, 4.5, by = 1),
+  main = paste("Posterior predictive for phone", i),
+  xlab = "Price category"
+)
+abline(v = y[i], col = "red", lwd = 2)
+
+# dev.off()
+```
+
+- Example plot of a phone prediction. Red is the true category. Shows that the model accurately predicts training set phones
+
+```{r, fig.height=4, fig.width=9}
+
+S <- dim(yrep_basic)[1]
+N <- dim(yrep_basic)[2]
+
+y_pred_mode <- apply(yrep_basic, 2, function(x) {
+  as.numeric(names(sort(table(x), decreasing = TRUE)[1]))
+})
+
+df_check <- data.frame(
+  RAM = train$ram,
+  observed_category   = factor(y,           levels = 1:K),
+  predicted_category  = factor(y_pred_mode, levels = 1:K)
+)
+
+orig_ram_price <- ggplot(df_check, aes(x = observed_category, y = RAM)) +
+  geom_boxplot(fill = "lightblue", alpha = .6) +
+  labs(title = "Observed RAM distribution by price tier")
+
+ppc_ram_price <- ggplot(df_check, aes(x = predicted_category, y = RAM)) +
+  geom_boxplot(fill = "lightgreen", alpha = .6) +
+  labs(title = "Predicted RAM distribution by price tier\n(posterior predictive mode)")
+
+
+g <- arrangeGrob(orig_ram_price, ppc_ram_price, ncol = 2)
+grid.arrange(orig_ram_price, ppc_ram_price, ncol = 2)
+ggsave(file="ram_price_ppc.png", g, dpi=600)
+```
+
+- We compared the distribution of RAM across observed categories to the distribution under the posterior predictive price assignments
+    - We find that the model reproduces the monotonic trend between RAM and price tier, implying that the estimated coefficients faithfully capture the relationship between hardware specifications and price structure and that the model is capable of generating realistic phone price distributions
